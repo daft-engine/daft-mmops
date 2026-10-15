@@ -15,11 +15,11 @@ from typing import Iterator
 
 import av
 import daft
+import fsspec
 import mmops.operators as operators
 from mmops.operators.robotics import mcap_to_mp4 as mcap_module
 import pyarrow as pa
 import pytest
-import tos
 from mcap.writer import Writer as McapWriter
 from mcap_ros2.writer import Writer
 
@@ -458,6 +458,98 @@ def test_tos_configuration_is_lazy_for_local_paths(tmp_path: Path) -> None:
     assert extractor.extract(str(source), str(output))["frame_count"] == 3
 
 
+def test_extract_reads_tos_uri_through_fsspec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "camera.mcap"
+    output = tmp_path / "camera.mp4"
+    _write_compressed_image_mcap(source)
+    payload = source.read_bytes()
+
+    class MemoryTosFilesystem:
+        def open(self, path: str, mode: str, **kwargs: object) -> io.BytesIO:
+            assert path == "input/camera.mcap"
+            assert mode == "rb"
+            return io.BytesIO(payload)
+
+    def filesystem(protocol: str, **kwargs: object) -> MemoryTosFilesystem:
+        assert protocol == "tos"
+        assert kwargs["endpoint"] == "tos-cn-beijing.volces.com"
+        assert kwargs["region"] == "cn-beijing"
+        assert kwargs["key"] == "test-ak"
+        assert kwargs["secret"] == "test-sk"
+        assert kwargs["session_token"] == "test-token"
+        return MemoryTosFilesystem()
+
+    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
+    monkeypatch.setenv("TOS_REGION", "cn-beijing")
+    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
+    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
+    monkeypatch.setenv("TOS_SECURITY_TOKEN", "test-token")
+    monkeypatch.setattr(fsspec, "filesystem", filesystem)
+
+    result = operators.McapVideoExtractor().extract(
+        "tos://input/camera.mcap", str(output)
+    )
+
+    assert result["frame_count"] == 3
+    assert output.exists()
+
+
+class _MemoryTosFilesystem:
+    def __init__(
+        self,
+        objects: dict[tuple[str, str], bytes],
+        client: object,
+        *,
+        truncate_upload: bool = False,
+        corrupt_upload: bool = False,
+        raise_after_upload: Exception | None = None,
+    ) -> None:
+        self.objects = objects
+        self.tos_client = client
+        self.truncate_upload = truncate_upload
+        self.corrupt_upload = corrupt_upload
+        self.raise_after_upload = raise_after_upload
+        self.opened: list[io.BytesIO] = []
+        self.removed: list[str] = []
+
+    @staticmethod
+    def _location(path: str) -> tuple[str, str]:
+        assert not path.startswith("tos://")
+        bucket, key = path.split("/", 1)
+        return bucket, key
+
+    def open(self, path: str, mode: str, **kwargs: object) -> io.BytesIO:
+        assert mode == "rb"
+        assert kwargs.get("cache_type") == "none"
+        stream = io.BytesIO(self.objects[self._location(path)])
+        self.opened.append(stream)
+        return stream
+
+    def put_file(self, local_path: str, remote_path: str) -> None:
+        assert Path(local_path).suffix == ".mp4"
+        data = Path(local_path).read_bytes()
+        if self.truncate_upload:
+            data = data[:-1]
+        if self.corrupt_upload:
+            data = bytes([data[0] ^ 1]) + data[1:]
+        self.objects[self._location(remote_path)] = data
+        if self.raise_after_upload is not None:
+            raise self.raise_after_upload
+
+    def info(self, path: str) -> dict[str, int]:
+        return {"size": len(self.objects[self._location(path)])}
+
+    def rm(self, path: str) -> None:
+        self.removed.append(path)
+        self.objects.pop(self._location(path), None)
+
+    def invalidate_cache(self, path: str) -> None:
+        pass
+
+
 def test_extract_streams_from_tos_and_uploads_verified_mp4(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -465,61 +557,16 @@ def test_extract_streams_from_tos_and_uploads_verified_mp4(
     source = tmp_path / "camera.mcap"
     _write_compressed_image_mcap(source)
     objects = {("input", "camera.mcap"): source.read_bytes()}
-    metadata: dict[tuple[str, str], dict[str, str]] = {}
-    download = None
-
-    class ReaderAdapterWithoutClose:
-        """Matches the CRC adapter returned by tos 2.9.x."""
-
-        def __init__(self, data: bytes) -> None:
-            self.data = io.BytesIO(data)
-
-        def read(self, amount: int | None = None) -> bytes:
-            return self.data.read(amount)
-
-    class StreamingObject:
-        def __init__(self, data: bytes) -> None:
-            self.content = ReaderAdapterWithoutClose(data)
-
-        def read(self, amount: int | None = None) -> bytes:
-            return self.content.read(amount)
 
     class FakeTosClient:
-        def __init__(self, **_: object) -> None:
-            pass
-
         def get_bucket_version(self, bucket: str) -> object:
             assert bucket == "output"
             return SimpleNamespace(status=SimpleNamespace(value="Unknown"))
-
-        def get_object(self, bucket: str, key: str) -> StreamingObject:
-            nonlocal download
-            download = StreamingObject(objects[(bucket, key)])
-            return download
-
-        def put_object_from_file(
-            self,
-            bucket: str,
-            key: str,
-            file_path: str,
-            *,
-            forbid_overwrite: bool,
-            content_type: str,
-            meta: dict[str, str],
-        ) -> object:
-            assert forbid_overwrite is True
-            assert content_type == "video/mp4"
-            assert bucket == "output"
-            assert key.startswith("camera.mp4.mmops-staging-")
-            objects[(bucket, key)] = Path(file_path).read_bytes()
-            metadata[(bucket, key)] = meta
-            return SimpleNamespace(etag=meta["sha256"])
 
         def head_object(self, bucket: str, key: str) -> object:
             data = objects[(bucket, key)]
             return SimpleNamespace(
                 content_length=len(data),
-                meta=metadata[(bucket, key)],
                 etag=hashlib.sha256(data).hexdigest(),
                 version_id=None,
             )
@@ -542,28 +589,18 @@ def test_extract_streams_from_tos_and_uploads_verified_mp4(
             )
             assert (bucket, key) not in objects
             objects[(bucket, key)] = objects[(src_bucket, src_key)]
-            metadata[(bucket, key)] = metadata[(src_bucket, src_key)]
             return SimpleNamespace(
                 etag=copy_source_if_match,
                 version_id=None,
             )
 
-        def delete_object(
-            self,
-            bucket: str,
-            key: str,
-            version_id: str | None = None,
-        ) -> object:
-            assert version_id is None
-            objects.pop((bucket, key), None)
-            metadata.pop((bucket, key), None)
-            return SimpleNamespace()
+    filesystem = _MemoryTosFilesystem(objects, FakeTosClient())
 
     monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
     monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
     monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
     monkeypatch.setenv("TOS_REGION", "cn-beijing")
-    monkeypatch.setattr(tos, "TosClientV2", FakeTosClient)
+    monkeypatch.setattr(fsspec, "filesystem", lambda *_args, **_kwargs: filesystem)
 
     result = operators.McapVideoExtractor(
         temp_dir=str(tmp_path),
@@ -572,8 +609,9 @@ def test_extract_streams_from_tos_and_uploads_verified_mp4(
         "tos://output/camera.mp4",
     )
 
-    assert download is not None
-    assert download.content.data.closed
+    assert filesystem.opened
+    assert all(stream.closed for stream in filesystem.opened)
+    assert any("mmops-staging" in path for path in filesystem.removed)
     assert not any("mmops-staging" in key for _, key in objects)
     mp4_bytes = objects[("output", "camera.mp4")]
     extracted = tmp_path / "uploaded.mp4"
@@ -592,46 +630,26 @@ def test_extract_streams_from_tos_and_uploads_verified_mp4(
     }
 
 
-def test_extract_rejects_a_truncated_tos_publication(
+@pytest.mark.parametrize(
+    ("truncate_upload", "expected_error"),
+    [(True, "published TOS object size"), (False, "published TOS object sha256")],
+)
+def test_extract_rejects_a_corrupted_tos_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    truncate_upload: bool,
+    expected_error: str,
 ) -> None:
     source = tmp_path / "camera.mcap"
     _write_compressed_image_mcap(source)
-    source_bytes = source.read_bytes()
-    objects: dict[tuple[str, str], bytes] = {}
-    deleted: list[tuple[str, str]] = []
-
-    class StreamingObject:
-        def __init__(self, data: bytes) -> None:
-            self.content = io.BytesIO(data)
-
-        def read(self, amount: int | None = None) -> bytes:
-            return self.content.read(amount)
+    objects: dict[tuple[str, str], bytes] = {
+        ("input", "camera.mcap"): source.read_bytes()
+    }
 
     class CorruptingTosClient:
-        def __init__(self, **_: object) -> None:
-            pass
-
         def get_bucket_version(self, bucket: str) -> object:
             assert bucket == "output"
             return SimpleNamespace(status=SimpleNamespace(value="Unknown"))
-
-        def get_object(self, bucket: str, key: str) -> StreamingObject:
-            assert (bucket, key) == ("input", "camera.mcap")
-            return StreamingObject(source_bytes)
-
-        def put_object_from_file(
-            self,
-            bucket: str,
-            key: str,
-            file_path: str,
-            **_: object,
-        ) -> object:
-            assert bucket == "output"
-            assert key.startswith("camera.mp4.mmops-staging-")
-            objects[(bucket, key)] = Path(file_path).read_bytes()[:-1]
-            return SimpleNamespace(etag="truncated")
 
         def head_object(self, bucket: str, key: str) -> object:
             data = objects[(bucket, key)]
@@ -645,32 +663,28 @@ def test_extract_rejects_a_truncated_tos_publication(
         def copy_object(self, *_: object, **__: object) -> object:
             pytest.fail("corrupt staging object must not be copied to the final key")
 
-        def delete_object(
-            self,
-            bucket: str,
-            key: str,
-            version_id: str | None = None,
-        ) -> object:
-            assert version_id is None
-            deleted.append((bucket, key))
-            objects.pop((bucket, key), None)
-            return SimpleNamespace()
+    filesystem = _MemoryTosFilesystem(
+        objects,
+        CorruptingTosClient(),
+        truncate_upload=truncate_upload,
+        corrupt_upload=not truncate_upload,
+    )
 
     monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
     monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
     monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
     monkeypatch.setenv("TOS_REGION", "cn-beijing")
-    monkeypatch.setattr(tos, "TosClientV2", CorruptingTosClient)
+    monkeypatch.setattr(fsspec, "filesystem", lambda *_args, **_kwargs: filesystem)
 
-    with pytest.raises(ValueError, match="published TOS object size"):
+    with pytest.raises(ValueError, match=expected_error):
         operators.McapVideoExtractor(temp_dir=str(tmp_path)).extract(
             "tos://input/camera.mcap",
             "tos://output/camera.mp4",
         )
 
     assert ("output", "camera.mp4") not in objects
-    assert len(deleted) == 1
-    assert not objects
+    assert len(filesystem.removed) == 1
+    assert objects == {("input", "camera.mcap"): source.read_bytes()}
 
 
 @pytest.mark.parametrize("status", ["Enabled", "Suspended"])
@@ -686,17 +700,18 @@ def test_tos_publication_rejects_a_versioned_bucket(
             assert bucket == "output"
             return SimpleNamespace(status=SimpleNamespace(value=status))
 
-        def put_object_from_file(self, *_: object, **__: object) -> object:
-            pytest.fail("versioned buckets must be rejected before upload")
+    objects: dict[tuple[str, str], bytes] = {}
+    filesystem = _MemoryTosFilesystem(objects, VersionedTosClient())
 
     with pytest.raises(ValueError, match=f"versioning is {status}"):
         mcap_module._publish_output(
             temporary,
             "tos://output/camera.mp4",
-            VersionedTosClient(),
+            filesystem,
             hashlib.sha256(temporary.read_bytes()).hexdigest(),
             temporary.stat().st_size,
         )
+    assert not objects
 
 
 def test_tos_staging_is_cleaned_when_upload_commits_then_raises(
@@ -711,41 +726,27 @@ def test_tos_staging_is_cleaned_when_upload_commits_then_raises(
             assert bucket == "output"
             return SimpleNamespace(status=SimpleNamespace(value="Unknown"))
 
-        def put_object_from_file(
-            self,
-            bucket: str,
-            key: str,
-            file_path: str,
-            **_: object,
-        ) -> object:
-            assert key.startswith("camera.mp4.mmops-staging-")
-            objects[(bucket, key)] = Path(file_path).read_bytes()
-            raise ConnectionError("response lost after commit")
-
         def head_object(self, bucket: str, key: str) -> object:
             assert (bucket, key) in objects
             return SimpleNamespace(version_id=None)
 
-        def delete_object(
-            self,
-            bucket: str,
-            key: str,
-            version_id: str | None = None,
-        ) -> object:
-            assert version_id is None
-            objects.pop((bucket, key), None)
-            return SimpleNamespace()
+    filesystem = _MemoryTosFilesystem(
+        objects,
+        CommitThenRaiseTosClient(),
+        raise_after_upload=ConnectionError("response lost after commit"),
+    )
 
     with pytest.raises(ConnectionError, match="response lost after commit"):
         mcap_module._publish_output(
             temporary,
             "tos://output/camera.mp4",
-            CommitThenRaiseTosClient(),
+            filesystem,
             hashlib.sha256(temporary.read_bytes()).hexdigest(),
             temporary.stat().st_size,
         )
 
     assert not objects
+    assert len(filesystem.removed) == 1
 
 
 def test_tos_publication_removes_exact_version_if_versioning_changes_midflight(
@@ -755,19 +756,11 @@ def test_tos_publication_removes_exact_version_if_versioning_changes_midflight(
     temporary.write_bytes(b"verified")
     digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
     deleted: list[tuple[str, str, str | None]] = []
+    objects: dict[tuple[str, str], bytes] = {}
 
     class VersioningRaceTosClient:
         def get_bucket_version(self, bucket: str) -> object:
             return SimpleNamespace(status=SimpleNamespace(value="Unknown"))
-
-        def put_object_from_file(
-            self,
-            bucket: str,
-            key: str,
-            file_path: str,
-            **_: object,
-        ) -> object:
-            return SimpleNamespace(etag=digest, version_id=None)
 
         def head_object(self, bucket: str, key: str) -> object:
             return SimpleNamespace(
@@ -789,17 +782,18 @@ def test_tos_publication_removes_exact_version_if_versioning_changes_midflight(
             deleted.append((bucket, key, version_id))
             return SimpleNamespace()
 
+    filesystem = _MemoryTosFilesystem(objects, VersioningRaceTosClient())
     with pytest.raises(RuntimeError, match="versioning changed"):
         mcap_module._publish_output(
             temporary,
             "tos://output/camera.mp4",
-            VersioningRaceTosClient(),
+            filesystem,
             digest,
             temporary.stat().st_size,
         )
 
     assert ("output", "camera.mp4", "new-version") in deleted
-    assert any("mmops-staging" in key for _, key, _ in deleted)
+    assert any("mmops-staging" in path for path in filesystem.removed)
 
 
 def test_tos_publication_never_deletes_an_ambiguous_unversioned_final_key(
@@ -810,19 +804,11 @@ def test_tos_publication_never_deletes_an_ambiguous_unversioned_final_key(
     digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
     deleted: list[str] = []
     head_calls = 0
+    objects: dict[tuple[str, str], bytes] = {}
 
     class AmbiguousFinalTosClient:
         def get_bucket_version(self, bucket: str) -> object:
             return SimpleNamespace(status=SimpleNamespace(value="Unknown"))
-
-        def put_object_from_file(
-            self,
-            bucket: str,
-            key: str,
-            file_path: str,
-            **_: object,
-        ) -> object:
-            return SimpleNamespace(etag=digest, version_id=None)
 
         def head_object(self, bucket: str, key: str) -> object:
             nonlocal head_calls
@@ -842,6 +828,7 @@ def test_tos_publication_never_deletes_an_ambiguous_unversioned_final_key(
             )
 
         def copy_object(self, *_: object, **__: object) -> object:
+            objects[("output", "camera.mp4")] = b"x"
             return SimpleNamespace(etag=digest, version_id=None)
 
         def delete_object(
@@ -853,18 +840,19 @@ def test_tos_publication_never_deletes_an_ambiguous_unversioned_final_key(
             deleted.append(key)
             return SimpleNamespace()
 
+    filesystem = _MemoryTosFilesystem(objects, AmbiguousFinalTosClient())
     with pytest.raises(RuntimeError, match="preserved.*concurrent writes"):
         mcap_module._publish_output(
             temporary,
             "tos://output/camera.mp4",
-            AmbiguousFinalTosClient(),
+            filesystem,
             digest,
             temporary.stat().st_size,
         )
 
     assert head_calls >= 2
     assert "camera.mp4" not in deleted
-    assert any("mmops-staging" in key for key in deleted)
+    assert any("mmops-staging" in path for path in filesystem.removed)
 
 
 def test_extract_runs_in_a_real_daft_dataframe(tmp_path: Path) -> None:

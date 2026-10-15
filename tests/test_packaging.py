@@ -45,12 +45,13 @@ def test_all_extra_contains_every_released_domain_dependency() -> None:
     assert set(extras["all"]) == domain_dependencies
 
 
-def test_robotics_extra_installs_mcap_remux_and_tos_dependencies() -> None:
+def test_robotics_extra_installs_mcap_remux_and_tos_filesystem_dependencies() -> None:
     extras = _extras()
 
-    assert {"daft", "mcap", "mcap-ros2-support", "av", "tos"} <= _names(
+    assert {"daft", "mcap", "mcap-ros2-support", "av", "fsspec", "tosfs"} <= _names(
         extras["robotics"]
     )
+    assert "tos" not in _names(extras["robotics"])
 
 
 def test_test_extra_installs_dependencies_imported_by_the_full_suite() -> None:
@@ -61,7 +62,8 @@ def test_test_extra_installs_dependencies_imported_by_the_full_suite() -> None:
         "mcap",
         "mcap-ros2-support",
         "av",
-        "tos",
+        "fsspec",
+        "tosfs",
         "pytest",
     } <= _names(extras["test"])
 
@@ -82,7 +84,8 @@ def test_dev_extra_supports_every_documented_verification_command() -> None:
         "mcap",
         "mcap-ros2-support",
         "av",
-        "tos",
+        "fsspec",
+        "tosfs",
         "pytest",
         "black",
         "build",

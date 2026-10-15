@@ -32,7 +32,7 @@ Available extras:
 | `image` | reserved for image operators; currently empty |
 | `audio` | reserved for audio operators; currently empty |
 | `video` | reserved for video operators; currently empty |
-| `robotics` | Daft runtime, MCAP/ROS2 decoding, H.264 remuxing, and TOS support |
+| `robotics` | Daft runtime, MCAP/ROS2 decoding, H.264 remuxing, and fsspec TOS support |
 | `document` | reserved for document operators; currently empty |
 | `multimodal` | reserved for cross-modal operators; currently empty |
 | `all` | dependency union of `text`, `image`, `audio`, `video`, `robotics`, `document`, and `multimodal` |
@@ -185,10 +185,12 @@ return null. A partial null pair, unsupported requested format, non-increasing
 timestamps, unsupported source H.264 B-frame reordering, undecodable video,
 missing topic, or an existing output is an error.
 
-TOS access uses `TOS_ENDPOINT`, `TOS_REGION`, `TOS_ACCESS_KEY`,
-`TOS_SECRET_KEY`, and optional `TOS_SECURITY_TOKEN` from the worker
-environment. Environment-specific values are not constructor arguments and
-are therefore not serialized with the operator.
+TOS access uses the `tosfs` fsspec filesystem with `TOS_ENDPOINT`,
+`TOS_REGION`, `TOS_ACCESS_KEY`, `TOS_SECRET_KEY`, and optional
+`TOS_SECURITY_TOKEN` from the worker environment. The robotics extra declares
+`fsspec` and `tosfs`, without a direct `tos` requirement; `tosfs` manages its
+own SDK dependency. Environment-specific values are not constructor arguments
+and are therefore not serialized with the operator.
 Each output is first completed and verified in a worker-local temporary file;
 set `temp_dir` when the default temporary filesystem is too small. Allow free
 temporary disk roughly equal to the resulting MP4 size. TOS publishing first

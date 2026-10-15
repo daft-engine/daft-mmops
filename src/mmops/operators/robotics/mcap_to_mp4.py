@@ -95,9 +95,9 @@ class McapVideoExtractor:
         self.output_codec = output_codec
         self.h264_crf = h264_crf
         self.h264_preset = h264_preset
-        self._client: Any | None = None
+        self._filesystem: Any | None = None
 
-    def _tos_client(self) -> Any:
+    def _tos_filesystem(self) -> Any:
         endpoint = os.environ.get("TOS_ENDPOINT")
         region = os.environ.get("TOS_REGION")
         if not endpoint or not region:
@@ -105,15 +105,26 @@ class McapVideoExtractor:
                 "TOS_ENDPOINT and TOS_REGION are required in the worker environment "
                 "when an input or output uses tos://"
             )
-        if self._client is None:
-            import tos
+        key = os.environ.get("TOS_ACCESS_KEY")
+        secret = os.environ.get("TOS_SECRET_KEY")
+        if not key or not secret:
+            raise ValueError(
+                "TOS_ACCESS_KEY and TOS_SECRET_KEY are required in the worker "
+                "environment when an input or output uses tos://"
+            )
+        if self._filesystem is None:
+            import fsspec
 
-            self._client = tos.TosClientV2(
+            fsspec.register_implementation("tos", "tosfs.TosFileSystem")
+            self._filesystem = fsspec.filesystem(
+                "tos",
                 endpoint=endpoint,
                 region=region,
-                credentials_provider=tos.EnvCredentialsProvider(),
+                key=key,
+                secret=secret,
+                session_token=os.environ.get("TOS_SECURITY_TOKEN"),
             )
-        return self._client
+        return self._filesystem
 
     @row(return_dtype=MCAP_VIDEO_RESULT_DTYPE)
     def extract(
@@ -149,8 +160,8 @@ class McapVideoExtractor:
 
         _validate_source_uri(mcap_uri)
         _validate_destination_uri(mp4_uri)
-        client = (
-            self._tos_client()
+        filesystem = (
+            self._tos_filesystem()
             if _is_tos_uri(mcap_uri) or _is_tos_uri(mp4_uri)
             else None
         )
@@ -158,7 +169,7 @@ class McapVideoExtractor:
             mcap_uri,
             mp4_uri,
             topic,
-            tos_client=client,
+            tos_filesystem=filesystem,
             temp_dir=self.temp_dir,
             output_codec=self.output_codec,
             h264_crf=self.h264_crf,
@@ -171,13 +182,13 @@ class _NonSeekingStream:
         self._source = source
 
     def read(self, amount: int = -1) -> bytes:
-        return self._source.read(None if amount < 0 else amount)
+        return self._source.read(amount)
 
     def seekable(self) -> bool:
         return False
 
     def close(self) -> None:
-        """Close the underlying HTTP response, including TOS SDK adapters."""
+        """Close the underlying HTTP response or fsspec file."""
 
         current = self._source
         visited: set[int] = set()
@@ -251,13 +262,14 @@ def _validate_destination_uri(uri: str) -> None:
 
 
 @contextmanager
-def _open_source(uri: str, tos_client: Any | None) -> Iterator[BinaryIO]:
+def _open_source(uri: str, tos_filesystem: Any | None) -> Iterator[BinaryIO]:
     if _is_tos_uri(uri):
-        if tos_client is None:
-            raise RuntimeError("TOS client is unavailable")
+        if tos_filesystem is None:
+            raise RuntimeError("TOS filesystem is unavailable")
         bucket, key = _tos_location(uri)
-        response = tos_client.get_object(bucket, key)
-        stream = _NonSeekingStream(response)
+        stream = _NonSeekingStream(
+            tos_filesystem.open(f"{bucket}/{key}", "rb", cache_type="none")
+        )
         try:
             yield stream  # type: ignore[misc]
         finally:
@@ -284,7 +296,8 @@ def _temporary_output(destination_uri: str, temp_dir: str | None) -> Path:
             directory.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(
             prefix="mmops-mcap-",
-            suffix=".mp4.tmp",
+            # tosfs infers Content-Type from the local filename on put_file.
+            suffix=".mp4",
             dir=directory,
         )
     else:
@@ -566,12 +579,16 @@ def _write_video(
     )
 
 
-def _sha256(path: Path) -> str:
+def _sha256_stream(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return _sha256_stream(stream)
 
 
 def _verify_mp4(
@@ -626,33 +643,30 @@ def _verify_mp4(
 def _publish_output(
     temporary: Path,
     destination_uri: str,
-    tos_client: Any | None,
+    tos_filesystem: Any | None,
     sha256: str,
     size_bytes: int,
 ) -> None:
     if _is_tos_uri(destination_uri):
+        if tos_filesystem is None:
+            raise RuntimeError("TOS filesystem is unavailable")
+        # fsspec has no atomic conditional copy or bucket-versioning interface.
+        # Keep these publication-only operations on the tosfs backend client.
+        tos_client = getattr(tos_filesystem, "tos_client", None)
         if tos_client is None:
-            raise RuntimeError("TOS client is unavailable")
+            raise RuntimeError("TOS filesystem lacks conditional publication support")
         bucket, key = _tos_location(destination_uri)
         _require_unversioned_tos_bucket(tos_client, bucket)
         staging_key = f"{key}.mmops-staging-{uuid4().hex}"
-        staged_upload: Any | None = None
+        staging_path = f"{bucket}/{staging_key}"
+        final_path = f"{bucket}/{key}"
         staging_upload_attempted = False
         try:
             staging_upload_attempted = True
-            staged_upload = tos_client.put_object_from_file(
-                bucket,
-                staging_key,
-                str(temporary),
-                forbid_overwrite=True,
-                content_type="video/mp4",
-                meta={"sha256": sha256},
-            )
+            tos_filesystem.put_file(str(temporary), staging_path)
+            _verify_tos_object(tos_filesystem, staging_path, size_bytes, sha256)
             staged = tos_client.head_object(bucket, staging_key)
-            _verify_tos_object(staged, size_bytes, sha256)
-            source_etag = getattr(staged, "etag", None) or getattr(
-                staged_upload, "etag", None
-            )
+            source_etag = getattr(staged, "etag", None)
             if not source_etag:
                 raise ValueError("staged TOS object is missing an ETag")
 
@@ -670,10 +684,9 @@ def _publish_output(
                     "TOS bucket versioning changed during publication; the new "
                     "object version was removed and the final key was not accepted"
                 )
-            published: Any | None = None
+            tos_filesystem.invalidate_cache(final_path)
             try:
-                published = tos_client.head_object(bucket, key)
-                _verify_tos_object(published, size_bytes, sha256)
+                _verify_tos_object(tos_filesystem, final_path, size_bytes, sha256)
             except Exception as error:
                 raise RuntimeError(
                     "TOS final object verification failed; the unversioned final "
@@ -684,10 +697,10 @@ def _publish_output(
             if staging_upload_attempted:
                 try:
                     _remove_tos_staging_object(
+                        tos_filesystem,
                         tos_client,
                         bucket,
                         staging_key,
-                        staged_upload,
                     )
                 except Exception as error:
                     warnings.warn(
@@ -705,14 +718,19 @@ def _publish_output(
         raise FileExistsError(f"output already exists: {destination}") from None
 
 
-def _verify_tos_object(published: Any, size_bytes: int, sha256: str) -> None:
-    if published.content_length != size_bytes:
+def _verify_tos_object(
+    tos_filesystem: Any, path: str, size_bytes: int, sha256: str
+) -> None:
+    published_size = tos_filesystem.info(path)["size"]
+    if published_size != size_bytes:
         raise ValueError(
-            f"published TOS object size {published.content_length} does not "
+            f"published TOS object size {published_size} does not "
             f"match verified MP4 size {size_bytes}"
         )
-    if published.meta.get("sha256") != sha256:
-        raise ValueError("published TOS object is missing the verified MP4 sha256")
+    with tos_filesystem.open(path, "rb", cache_type="none") as stream:
+        published_sha256 = _sha256_stream(stream)
+    if published_sha256 != sha256:
+        raise ValueError("published TOS object sha256 does not match verified MP4")
 
 
 def _require_unversioned_tos_bucket(tos_client: Any, bucket: str) -> None:
@@ -726,19 +744,21 @@ def _require_unversioned_tos_bucket(tos_client: Any, bucket: str) -> None:
 
 
 def _remove_tos_staging_object(
+    tos_filesystem: Any,
     tos_client: Any,
     bucket: str,
     staging_key: str,
-    staged_upload: Any | None,
 ) -> None:
-    version_id = getattr(staged_upload, "version_id", None)
+    version_id = None
+    try:
+        staged = tos_client.head_object(bucket, staging_key)
+        version_id = getattr(staged, "version_id", None)
+    except Exception:
+        pass
     if version_id is None:
-        try:
-            staged = tos_client.head_object(bucket, staging_key)
-            version_id = getattr(staged, "version_id", None)
-        except Exception:
-            pass
-    tos_client.delete_object(bucket, staging_key, version_id=version_id)
+        tos_filesystem.rm(f"{bucket}/{staging_key}")
+    else:
+        tos_client.delete_object(bucket, staging_key, version_id=version_id)
 
 
 def _remove_created_tos_copy(
@@ -757,7 +777,7 @@ def _extract_uri(
     destination_uri: str,
     requested_topic: str | None,
     *,
-    tos_client: Any | None,
+    tos_filesystem: Any | None,
     temp_dir: str | None,
     output_codec: Literal["source", "h264"],
     h264_crf: int,
@@ -765,7 +785,7 @@ def _extract_uri(
 ) -> dict[str, object]:
     temporary = _temporary_output(destination_uri, temp_dir)
     try:
-        with _open_source(source_uri, tos_client) as input_stream:
+        with _open_source(source_uri, tos_filesystem) as input_stream:
             selected_topic, frame_count, actual_output_codec, source_is_h264 = (
                 _write_video(
                     input_stream,
@@ -787,7 +807,7 @@ def _extract_uri(
         _publish_output(
             temporary,
             destination_uri,
-            tos_client,
+            tos_filesystem,
             digest,
             size_bytes,
         )
