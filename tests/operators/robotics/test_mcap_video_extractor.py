@@ -458,6 +458,61 @@ def test_tos_configuration_is_lazy_for_local_paths(tmp_path: Path) -> None:
     assert extractor.extract(str(source), str(output))["frame_count"] == 3
 
 
+def test_local_paths_use_an_injected_fsspec_filesystem(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "camera.mcap"
+    output = tmp_path / "camera.mp4"
+    _write_compressed_image_mcap(source)
+    filesystem = fsspec.filesystem("file", skip_instance_cache=True)
+    opened: list[tuple[str, str]] = []
+    linked: list[tuple[str, str]] = []
+    original_open = filesystem.open
+    original_link = filesystem.link
+
+    def tracked_open(path: str, mode: str, **kwargs: object) -> object:
+        opened.append((str(path), mode))
+        return original_open(path, mode, **kwargs)
+
+    def tracked_link(source_path: str, destination_path: str) -> None:
+        linked.append((str(source_path), str(destination_path)))
+        original_link(source_path, destination_path)
+
+    monkeypatch.setattr(filesystem, "open", tracked_open)
+    monkeypatch.setattr(filesystem, "link", tracked_link)
+
+    result = operators.McapVideoExtractor(filesystem=filesystem).extract(
+        str(source), str(output)
+    )
+
+    assert result["frame_count"] == 3
+    assert (str(source), "rb") in opened
+    assert len(linked) == 1
+    assert linked[0][1] == str(output)
+
+
+def test_incompatible_injected_filesystem_is_not_ignored_for_tos(
+    tmp_path: Path,
+) -> None:
+    extractor = operators.McapVideoExtractor(filesystem=fsspec.filesystem("file"))
+
+    with pytest.raises(ValueError, match="filesystem.*tos"):
+        extractor.extract("tos://input/camera.mcap", str(tmp_path / "camera.mp4"))
+
+
+def test_incompatible_injected_filesystem_is_not_ignored_for_local_paths(
+    tmp_path: Path,
+) -> None:
+    class OtherFilesystem:
+        protocol = "other"
+
+    extractor = operators.McapVideoExtractor(filesystem=OtherFilesystem())
+
+    with pytest.raises(ValueError, match="filesystem.*file"):
+        extractor.extract(str(tmp_path / "camera.mcap"), str(tmp_path / "camera.mp4"))
+
+
 def test_extract_reads_tos_uri_through_fsspec(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -466,6 +521,7 @@ def test_extract_reads_tos_uri_through_fsspec(
     output = tmp_path / "camera.mp4"
     _write_compressed_image_mcap(source)
     payload = source.read_bytes()
+    local_filesystem = fsspec.filesystem("file")
 
     class MemoryTosFilesystem:
         def open(self, path: str, mode: str, **kwargs: object) -> io.BytesIO:
@@ -473,7 +529,9 @@ def test_extract_reads_tos_uri_through_fsspec(
             assert mode == "rb"
             return io.BytesIO(payload)
 
-    def filesystem(protocol: str, **kwargs: object) -> MemoryTosFilesystem:
+    def filesystem(protocol: str, **kwargs: object) -> object:
+        if protocol == "file":
+            return local_filesystem
         assert protocol == "tos"
         assert kwargs["endpoint"] == "tos-cn-beijing.volces.com"
         assert kwargs["region"] == "cn-beijing"
@@ -498,6 +556,8 @@ def test_extract_reads_tos_uri_through_fsspec(
 
 
 class _MemoryTosFilesystem:
+    protocol = "tos"
+
     def __init__(
         self,
         objects: dict[tuple[str, str], bytes],
@@ -595,14 +655,16 @@ def test_extract_streams_from_tos_and_uploads_verified_mp4(
             )
 
     filesystem = _MemoryTosFilesystem(objects, FakeTosClient())
+    local_filesystem = fsspec.filesystem("file")
 
-    monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
-    monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
-    monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
-    monkeypatch.setenv("TOS_REGION", "cn-beijing")
-    monkeypatch.setattr(fsspec, "filesystem", lambda *_args, **_kwargs: filesystem)
+    for name in ("TOS_ACCESS_KEY", "TOS_SECRET_KEY", "TOS_ENDPOINT", "TOS_REGION"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        fsspec, "filesystem", lambda *_args, **_kwargs: local_filesystem
+    )
 
     result = operators.McapVideoExtractor(
+        filesystem=filesystem,
         temp_dir=str(tmp_path),
     ).extract(
         "tos://input/camera.mcap",
@@ -669,12 +731,19 @@ def test_extract_rejects_a_corrupted_tos_publication(
         truncate_upload=truncate_upload,
         corrupt_upload=not truncate_upload,
     )
+    local_filesystem = fsspec.filesystem("file")
 
     monkeypatch.setenv("TOS_ACCESS_KEY", "test-ak")
     monkeypatch.setenv("TOS_SECRET_KEY", "test-sk")
     monkeypatch.setenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com")
     monkeypatch.setenv("TOS_REGION", "cn-beijing")
-    monkeypatch.setattr(fsspec, "filesystem", lambda *_args, **_kwargs: filesystem)
+    monkeypatch.setattr(
+        fsspec,
+        "filesystem",
+        lambda protocol, **_kwargs: (
+            filesystem if protocol == "tos" else local_filesystem
+        ),
+    )
 
     with pytest.raises(ValueError, match=expected_error):
         operators.McapVideoExtractor(temp_dir=str(tmp_path)).extract(
@@ -882,6 +951,42 @@ def test_extract_runs_in_a_real_daft_dataframe(tmp_path: Path) -> None:
             "codec": "h264",
         }
     ]
+
+
+def test_injected_tos_filesystem_runs_in_a_real_daft_dataframe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "camera.mcap"
+    output = tmp_path / "camera.mp4"
+    _write_compressed_image_mcap(source)
+    filesystem = _MemoryTosFilesystem(
+        {("input", "camera.mcap"): source.read_bytes()}, None
+    )
+    for name in (
+        "TOS_ENDPOINT",
+        "TOS_REGION",
+        "TOS_ACCESS_KEY",
+        "TOS_SECRET_KEY",
+        "TOS_SECURITY_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    df = daft.from_pydict(
+        {
+            "mcap_uri": ["tos://input/camera.mcap"],
+            "mp4_uri": [str(output)],
+        }
+    )
+    result = df.with_column(
+        "video",
+        operators.McapVideoExtractor(filesystem=filesystem).extract(
+            df["mcap_uri"], df["mp4_uri"]
+        ),
+    ).to_pydict()
+
+    assert result["video"][0]["frame_count"] == 3
+    assert output.exists()
 
 
 def test_jpeg_to_h264_encoding_runs_in_a_real_daft_dataframe(

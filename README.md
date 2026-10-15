@@ -132,9 +132,11 @@ entrypoint is invoked because Daft initializes operator instances lazily.
 
 `McapVideoExtractor` turns one MCAP camera capture into one MP4 object. MCAP
 input accepts local paths, fsspec-compatible `tos://bucket/key` URIs, and
-HTTP(S) URLs. MP4 output accepts local paths and `tos://` URIs. Other fsspec
-protocols are not yet accepted by this operator. The UDF returns metadata,
-not the MP4 bytes, and runs as a 1:1 Daft row operator.
+HTTP(S) URLs. MP4 output accepts local paths and `tos://` URIs. Local paths
+also use fsspec, and callers may inject a compatible filesystem at
+construction. Other fsspec protocols are not yet accepted by this operator.
+The UDF returns metadata, not the MP4 bytes, and runs as a 1:1 Daft row
+operator.
 
 ```python
 import daft
@@ -155,11 +157,13 @@ result = df.with_column(
 print(result.select("video").to_pydict())  # triggers Daft execution
 ```
 
-For `tos://` access, set `TOS_ENDPOINT`, `TOS_REGION`, `TOS_ACCESS_KEY`, and
-`TOS_SECRET_KEY` in every Daft worker's environment; temporary credentials
-also need `TOS_SECURITY_TOKEN`. Keep their values out of code and DataFrame
-columns. See the [McapVideoExtractor usage guide](docs/mcap-video-extractor.md)
-for credential setup, codec options, output schema, and publication safeguards.
+For `tos://` access without an injected filesystem, set `TOS_ENDPOINT`,
+`TOS_REGION`, `TOS_ACCESS_KEY`, and `TOS_SECRET_KEY` in every Daft worker's
+environment; temporary credentials also need `TOS_SECURITY_TOKEN`. Keep
+their values out of code, DataFrame columns, and serialized filesystems. See
+the [McapVideoExtractor usage guide](docs/mcap-video-extractor.md) for
+filesystem injection, credential setup, codec options, output schema, and
+publication safeguards.
 
 ## Current execution scope
 

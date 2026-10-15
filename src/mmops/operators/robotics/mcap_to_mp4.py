@@ -63,17 +63,28 @@ class McapVideoExtractor:
     MCAP input may be a local path, a ``tos://`` object URI, or an
     ``http://``/``https://`` URL. MP4 output may be a local path or a
     ``tos://`` object URI. HTTP inputs are consumed as non-seeking streams and
-    are not downloaded into memory as a whole.
+    are not downloaded into memory as a whole. Local paths use fsspec's local
+    filesystem. A compatible filesystem may be passed to the constructor;
+    it must be pickleable for Daft worker execution.
     """
 
     def __init__(
         self,
         *,
+        filesystem: Any | None = None,
         temp_dir: str | None = None,
         output_codec: Literal["source", "h264"] = "h264",
         h264_crf: int = 23,
         h264_preset: str = "medium",
     ) -> None:
+        """Configure output encoding and optionally inject a fsspec filesystem.
+
+        A supplied filesystem is used for matching local or ``tos://`` URIs.
+        For mixed TOS/local jobs, local paths use fsspec's local filesystem
+        unless the supplied filesystem supports the ``file`` protocol too.
+        Without an injected TOS filesystem, worker environment variables are
+        used to create one lazily.
+        """
         if output_codec not in ("source", "h264"):
             raise ValueError(
                 "output_codec must be 'source' or 'h264', " f"got {output_codec!r}"
@@ -95,7 +106,32 @@ class McapVideoExtractor:
         self.output_codec = output_codec
         self.h264_crf = h264_crf
         self.h264_preset = h264_preset
-        self._filesystem: Any | None = None
+        self._provided_filesystem = filesystem
+        self._tos_filesystem_cache: Any | None = None
+        self._local_filesystem_cache: Any | None = None
+
+    def _filesystem_for(
+        self,
+        protocol: Literal["file", "tos"],
+        *,
+        allow_default_local: bool = False,
+    ) -> Any:
+        provided = self._provided_filesystem
+        if provided is not None:
+            supported = getattr(provided, "protocol", ())
+            if isinstance(supported, str):
+                supported = (supported,)
+            if protocol in supported:
+                return provided
+            if protocol == "tos" or not allow_default_local:
+                raise ValueError(f"filesystem must support the {protocol} protocol")
+        if protocol == "tos":
+            return self._tos_filesystem()
+        if self._local_filesystem_cache is None:
+            import fsspec
+
+            self._local_filesystem_cache = fsspec.filesystem("file")
+        return self._local_filesystem_cache
 
     def _tos_filesystem(self) -> Any:
         endpoint = os.environ.get("TOS_ENDPOINT")
@@ -112,11 +148,11 @@ class McapVideoExtractor:
                 "TOS_ACCESS_KEY and TOS_SECRET_KEY are required in the worker "
                 "environment when an input or output uses tos://"
             )
-        if self._filesystem is None:
+        if self._tos_filesystem_cache is None:
             import fsspec
 
             fsspec.register_implementation("tos", "tosfs.TosFileSystem")
-            self._filesystem = fsspec.filesystem(
+            self._tos_filesystem_cache = fsspec.filesystem(
                 "tos",
                 endpoint=endpoint,
                 region=region,
@@ -124,7 +160,7 @@ class McapVideoExtractor:
                 secret=secret,
                 session_token=os.environ.get("TOS_SECURITY_TOKEN"),
             )
-        return self._filesystem
+        return self._tos_filesystem_cache
 
     @row(return_dtype=MCAP_VIDEO_RESULT_DTYPE)
     def extract(
@@ -160,16 +196,25 @@ class McapVideoExtractor:
 
         _validate_source_uri(mcap_uri)
         _validate_destination_uri(mp4_uri)
-        filesystem = (
-            self._tos_filesystem()
-            if _is_tos_uri(mcap_uri) or _is_tos_uri(mp4_uri)
-            else None
+        uses_tos = _is_tos_uri(mcap_uri) or _is_tos_uri(mp4_uri)
+        source_filesystem = (
+            None
+            if _is_http_uri(mcap_uri)
+            else self._filesystem_for(
+                "tos" if _is_tos_uri(mcap_uri) else "file",
+                allow_default_local=uses_tos,
+            )
+        )
+        destination_filesystem = self._filesystem_for(
+            "tos" if _is_tos_uri(mp4_uri) else "file",
+            allow_default_local=uses_tos,
         )
         return _extract_uri(
             mcap_uri,
             mp4_uri,
             topic,
-            tos_filesystem=filesystem,
+            source_filesystem=source_filesystem,
+            destination_filesystem=destination_filesystem,
             temp_dir=self.temp_dir,
             output_codec=self.output_codec,
             h264_crf=self.h264_crf,
@@ -262,13 +307,13 @@ def _validate_destination_uri(uri: str) -> None:
 
 
 @contextmanager
-def _open_source(uri: str, tos_filesystem: Any | None) -> Iterator[BinaryIO]:
+def _open_source(uri: str, source_filesystem: Any | None) -> Iterator[BinaryIO]:
     if _is_tos_uri(uri):
-        if tos_filesystem is None:
+        if source_filesystem is None:
             raise RuntimeError("TOS filesystem is unavailable")
         bucket, key = _tos_location(uri)
         stream = _NonSeekingStream(
-            tos_filesystem.open(f"{bucket}/{key}", "rb", cache_type="none")
+            source_filesystem.open(f"{bucket}/{key}", "rb", cache_type="none")
         )
         try:
             yield stream  # type: ignore[misc]
@@ -285,11 +330,17 @@ def _open_source(uri: str, tos_filesystem: Any | None) -> Iterator[BinaryIO]:
             stream.close()
         return
 
-    with Path(uri).open("rb") as input_stream:
+    if source_filesystem is None:
+        raise RuntimeError("local filesystem is unavailable")
+    with source_filesystem.open(uri, "rb") as input_stream:
         yield input_stream
 
 
-def _temporary_output(destination_uri: str, temp_dir: str | None) -> Path:
+def _temporary_output(
+    destination_uri: str,
+    temp_dir: str | None,
+    destination_filesystem: Any,
+) -> Path:
     if _is_tos_uri(destination_uri):
         directory = Path(temp_dir) if temp_dir is not None else None
         if directory is not None:
@@ -302,9 +353,9 @@ def _temporary_output(destination_uri: str, temp_dir: str | None) -> Path:
         )
     else:
         destination = Path(destination_uri)
-        if destination.exists():
+        if destination_filesystem.exists(str(destination)):
             raise FileExistsError(f"output already exists: {destination}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination_filesystem.makedirs(str(destination.parent), exist_ok=True)
         descriptor, name = tempfile.mkstemp(
             prefix=f".{destination.name}.",
             suffix=".tmp",
@@ -643,13 +694,12 @@ def _verify_mp4(
 def _publish_output(
     temporary: Path,
     destination_uri: str,
-    tos_filesystem: Any | None,
+    destination_filesystem: Any,
     sha256: str,
     size_bytes: int,
 ) -> None:
     if _is_tos_uri(destination_uri):
-        if tos_filesystem is None:
-            raise RuntimeError("TOS filesystem is unavailable")
+        tos_filesystem = destination_filesystem
         # fsspec has no atomic conditional copy or bucket-versioning interface.
         # Keep these publication-only operations on the tosfs backend client.
         tos_client = getattr(tos_filesystem, "tos_client", None)
@@ -713,7 +763,7 @@ def _publish_output(
 
     destination = Path(destination_uri)
     try:
-        os.link(temporary, destination)
+        destination_filesystem.link(str(temporary), str(destination))
     except FileExistsError:
         raise FileExistsError(f"output already exists: {destination}") from None
 
@@ -777,15 +827,16 @@ def _extract_uri(
     destination_uri: str,
     requested_topic: str | None,
     *,
-    tos_filesystem: Any | None,
+    source_filesystem: Any | None,
+    destination_filesystem: Any,
     temp_dir: str | None,
     output_codec: Literal["source", "h264"],
     h264_crf: int,
     h264_preset: str,
 ) -> dict[str, object]:
-    temporary = _temporary_output(destination_uri, temp_dir)
+    temporary = _temporary_output(destination_uri, temp_dir, destination_filesystem)
     try:
-        with _open_source(source_uri, tos_filesystem) as input_stream:
+        with _open_source(source_uri, source_filesystem) as input_stream:
             selected_topic, frame_count, actual_output_codec, source_is_h264 = (
                 _write_video(
                     input_stream,
@@ -807,7 +858,7 @@ def _extract_uri(
         _publish_output(
             temporary,
             destination_uri,
-            tos_filesystem,
+            destination_filesystem,
             digest,
             size_bytes,
         )

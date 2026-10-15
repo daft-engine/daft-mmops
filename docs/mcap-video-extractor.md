@@ -17,16 +17,41 @@ python -m pip install 'daft-mmops[robotics]'
 | `mcap_uri` | Local path, `tos://bucket/key`, HTTP URL, or HTTPS URL |
 | `mp4_uri` | Local path or `tos://bucket/key` |
 
-The `tos://` object address is accessed through fsspec. This UDF currently
-recognizes that object-store scheme only; an installed fsspec implementation
-for another scheme does not make `s3://` or other URIs valid here. HTTP(S) is
-input-only. Local paths refer to the filesystem visible to the executing
-worker, which may differ from the machine creating the DataFrame.
+Local paths and `tos://` object addresses are accessed through fsspec. This
+UDF currently recognizes that object-store scheme only; an installed fsspec
+implementation for another scheme does not make `s3://` or other URIs valid
+here. HTTP(S) is input-only. Local paths refer to the filesystem visible to
+the executing worker, which may differ from the machine creating the
+DataFrame.
+
+You can pass a preconfigured, pickleable fsspec filesystem directly to the
+extractor. It is used when its `protocol` matches the URI (`file` for local
+paths or `tos` for `tos://`); mixed TOS/local jobs use fsspec's local
+filesystem for the local side if the supplied filesystem only supports `tos`.
+An incompatible supplied filesystem for a `tos://` URI or a local-only job is
+an error. For a local-only job:
+
+```python
+import fsspec
+from mmops.operators.robotics import McapVideoExtractor
+
+filesystem = fsspec.filesystem("file")
+extractor = McapVideoExtractor(filesystem=filesystem)
+result = extractor.extract("/data/camera.mcap", "/data/camera.mp4")
+```
+
+For TOS, construct or obtain a compatible filesystem in your application and
+pass it as `McapVideoExtractor(filesystem=filesystem)`. Daft serializes the
+operator for worker execution, including the supplied filesystem. Check that
+the filesystem is pickleable and does **not** serialize access keys, tokens,
+or other secrets. Prefer worker-side identity or credential providers. A
+filesystem requiring non-pickleable clients or shipping credentials in its
+pickle is not suitable for this injection mode.
 
 ## Configure TOS credentials
 
-Set these environment variables **on every Daft worker before execution**
-when either URI uses `tos://`:
+When you do **not** inject a TOS filesystem, set these environment variables
+**on every Daft worker before execution** when either URI uses `tos://`:
 
 | Variable | Purpose | Required |
 | --- | --- | --- |
@@ -49,12 +74,12 @@ python pipeline.py
 ```
 
 Replace the placeholders using your secret manager or deployment system. Do
-not commit credentials, put them in DataFrame columns or UDF constructor
-arguments, or print them in logs. For distributed Daft execution, configure
-the worker environment too; setting variables only in the submitting process
-is not sufficient. Local and HTTP(S)-only jobs do not require TOS variables.
-The UDF passes these values to the fsspec filesystem as `endpoint`, `region`,
-`key`, `secret`, and `session_token`, respectively.
+not commit credentials, put them in DataFrame columns or serialized
+filesystem objects, or print them in logs. For distributed Daft execution,
+configure the worker environment too; setting variables only in the
+submitting process is not sufficient. Local and HTTP(S)-only jobs do not
+require TOS variables. The UDF passes these values to the fsspec filesystem
+as `endpoint`, `region`, `key`, `secret`, and `session_token`, respectively.
 
 ## Run the UDF
 
