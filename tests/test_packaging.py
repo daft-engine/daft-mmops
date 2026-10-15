@@ -54,6 +54,21 @@ def test_robotics_extra_installs_mcap_remux_and_tos_filesystem_dependencies() ->
     assert "tos" not in _names(extras["robotics"])
 
 
+def test_mcap_video_guide_is_linked_and_documents_worker_configuration() -> None:
+    guide_path = ROOT / "docs" / "mcap-video-extractor.md"
+
+    assert "(docs/mcap-video-extractor.md)" in (ROOT / "README.md").read_text()
+    guide = guide_path.read_text()
+    for variable in (
+        "TOS_ENDPOINT",
+        "TOS_REGION",
+        "TOS_ACCESS_KEY",
+        "TOS_SECRET_KEY",
+        "TOS_SECURITY_TOKEN",
+    ):
+        assert f"`{variable}`" in guide
+
+
 def test_test_extra_installs_dependencies_imported_by_the_full_suite() -> None:
     extras = _extras()
 

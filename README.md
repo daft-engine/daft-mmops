@@ -32,7 +32,7 @@ Available extras:
 | `image` | reserved for image operators; currently empty |
 | `audio` | reserved for audio operators; currently empty |
 | `video` | reserved for video operators; currently empty |
-| `robotics` | Daft runtime, MCAP/ROS2 decoding, H.264 remuxing, and fsspec TOS support |
+| `robotics` | Daft runtime, MCAP/ROS2 decoding, H.264 remuxing, and fsspec-compatible TOS object access |
 | `document` | reserved for document operators; currently empty |
 | `multimodal` | reserved for cross-modal operators; currently empty |
 | `all` | dependency union of `text`, `image`, `audio`, `video`, `robotics`, `document`, and `multimodal` |
@@ -131,15 +131,10 @@ entrypoint is invoked because Daft initializes operator instances lazily.
 ## Robotics operators
 
 `McapVideoExtractor` turns one MCAP camera capture into one MP4 object. MCAP
-input supports local paths, `tos://bucket/key` object URIs, and `http://` or
-`https://` URLs. MP4 output supports local paths and TOS object URIs; HTTP is
-read-only. HTTP responses and TOS objects are consumed as non-seeking streams,
-so the UDF does not load the complete MCAP into memory. Inputs may contain
-either ROS2 `sensor_msgs/msg/CompressedImage` H.264 messages or CDR-encoded
-`foxglove.CompressedImage` JPEG messages. Camera timestamps must be strictly
-increasing. Source H.264 must not use B-frame reordering. The completed MP4 is
-fully decoded once for validation, while the UDF keeps the large MP4 payload
-out of the Daft row and returns only metadata.
+input accepts local paths, fsspec-compatible `tos://bucket/key` URIs, and
+HTTP(S) URLs. MP4 output accepts local paths and `tos://` URIs. Other fsspec
+protocols are not yet accepted by this operator. The UDF returns metadata,
+not the MP4 bytes, and runs as a 1:1 Daft row operator.
 
 ```python
 import daft
@@ -157,56 +152,14 @@ result = df.with_column(
     "video",
     extractor.extract(df["mcap_uri"], df["mp4_uri"]),
 )
+print(result.select("video").to_pydict())  # triggers Daft execution
 ```
 
-`output_codec` is a batch-level constructor policy:
-
-| `output_codec` | H.264 input | JPEG input |
-| --- | --- | --- |
-| `"h264"` (default) | direct H.264 remux | decode JPEG and encode with CPU `libx264` |
-| `"source"` | direct H.264 remux | direct MJPEG remux |
-
-One extractor instance uses one output policy for the whole batch. Configure
-JPEG-to-H.264 quality with `h264_crf` (integer `0` through `51`, default `23`)
-and `h264_preset` (an x264 preset, default `"medium"`). H.264 encoding produces
-YUV420P output. The H.264 default prioritizes downstream storage and access
-performance, at the cost of CPU encoding for JPEG inputs. Set
-`output_codec="source"` explicitly to avoid re-encoding JPEG. Direct remux
-copies the compressed frame payloads without re-encoding; validation decoding
-does not alter the output.
-
-The result struct contains `output_uri`, `topic`, `frame_count`, `duration_ns`,
-`size_bytes`, `sha256`, and `codec`. `duration_ns` is the finalized MP4 timeline
-duration, including the last frame duration inferred from the preceding frame;
-`codec` is the actual MP4 codec (`h264` or `mjpeg`). A single supported camera
-topic is selected automatically; pass `topic="/camera/image/compressed"` when
-the MCAP contains more than one supported topic. Paired null input/output rows
-return null. A partial null pair, unsupported requested format, non-increasing
-timestamps, unsupported source H.264 B-frame reordering, undecodable video,
-missing topic, or an existing output is an error.
-
-TOS access uses the `tosfs` fsspec filesystem with `TOS_ENDPOINT`,
-`TOS_REGION`, `TOS_ACCESS_KEY`, `TOS_SECRET_KEY`, and optional
-`TOS_SECURITY_TOKEN` from the worker environment. The robotics extra declares
-`fsspec` and `tosfs`, without a direct `tos` requirement; `tosfs` manages its
-own SDK dependency. Environment-specific values are not constructor arguments
-and are therefore not serialized with the operator.
-Each output is first completed and verified in a worker-local temporary file;
-set `temp_dir` when the default temporary filesystem is too small. Allow free
-temporary disk roughly equal to the resulting MP4 size. TOS publishing first
-uploads and verifies a unique staging object, then performs a conditional
-server-side copy to the final key; local publishing uses a no-overwrite atomic
-link. TOS final-key publication fails closed when bucket versioning is enabled
-or suspended because TOS ignores no-overwrite headers for versioned buckets.
-Use a bucket where versioning has never been enabled and unique output URIs for
-each run because Daft retries do not provide exactly-once semantics for
-external side effects.
-
-JPEG-to-H.264 mode also needs CPU for decode and encode; size and throughput
-depend on CRF, preset, resolution, frame rate, and scene complexity. It does
-not use GPU/NVENC. Use direct `source` mode when preserving compressed JPEG
-payloads and minimizing CPU are more important than file size or H.264 player
-compatibility.
+For `tos://` access, set `TOS_ENDPOINT`, `TOS_REGION`, `TOS_ACCESS_KEY`, and
+`TOS_SECRET_KEY` in every Daft worker's environment; temporary credentials
+also need `TOS_SECURITY_TOKEN`. Keep their values out of code and DataFrame
+columns. See the [McapVideoExtractor usage guide](docs/mcap-video-extractor.md)
+for credential setup, codec options, output schema, and publication safeguards.
 
 ## Current execution scope
 

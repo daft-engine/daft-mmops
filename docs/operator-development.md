@@ -194,10 +194,10 @@ use unique run-scoped output paths when the engine cannot provide exactly-once
 external writes.
 
 For object stores that cannot atomically upload and verify a final key, publish
-through a unique staging key: upload, HEAD-verify size and digest metadata,
-conditionally copy to the final no-overwrite key, verify the final object, and
-remove the staging object. A failed staging verification must never poison the
-final key.
+through a unique staging key: upload, verify the staged size and content
+digest, conditionally copy to the final no-overwrite key, verify the final
+size and digest, and remove the staging object. A failed staging verification
+must never poison the final key.
 
 Before relying on an object-store no-overwrite condition, verify that bucket
 features such as versioning do not disable that condition. Fail closed when
