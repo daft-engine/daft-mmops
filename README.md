@@ -1,8 +1,8 @@
 # daft-mmops
 
 `daft-mmops` is a multimodal data processing operator library for Daft. It is
-intended for reusable text, image, audio, video, document, and cross-modal
-preprocessing, enrichment, model inference, and data annotation.
+intended for reusable text, image, audio, video, robotics, document, and
+cross-modal preprocessing, enrichment, model inference, and data annotation.
 
 The current release runs on Daft and provides:
 
@@ -18,7 +18,7 @@ Repository-wide automation rules are defined in [AGENTS.md](AGENTS.md).
 
 ## Installation
 
-Install only the released modality you need:
+Install only the released domain you need:
 
 ```bash
 python -m pip install 'daft-mmops[text]'
@@ -32,9 +32,10 @@ Available extras:
 | `image` | reserved for image operators; currently empty |
 | `audio` | reserved for audio operators; currently empty |
 | `video` | reserved for video operators; currently empty |
+| `robotics` | Daft runtime, MCAP/ROS2 decoding, H.264 remuxing, and fsspec-compatible TOS object access |
 | `document` | reserved for document operators; currently empty |
 | `multimodal` | reserved for cross-modal operators; currently empty |
-| `all` | dependency union of `text`, `image`, `audio`, `video`, `document`, and `multimodal`; currently equivalent to `text` |
+| `all` | dependency union of `text`, `image`, `audio`, `video`, `robotics`, `document`, and `multimodal` |
 | `daft` | Daft runtime for SDK users who only define custom operators |
 | `test` | dependencies needed to run pytest |
 | `dev` | complete contributor toolchain: tests, formatting, build, and metadata checks |
@@ -43,11 +44,11 @@ From a source checkout, add `-e`, for example
 `python -m pip install -e '.[text]'`. Python 3.10 or newer and PyArrow 12 or
 newer are required. Version `0.1` targets the public Daft 0.7 UDF API.
 
-All planned modality names are reserved as installation extras. An empty extra
-does not mean that the modality is implemented; it provides a stable install
+All planned domain names are reserved as installation extras. An empty extra
+does not mean that the domain is implemented; it provides a stable install
 name until its first production operator adds runtime dependencies. The `all`
-extra is always the flattened dependency union of all six modality extras, so
-empty modalities currently contribute no dependencies.
+extra is always the flattened dependency union of all seven domain extras, so
+empty domains currently contribute no dependencies.
 
 ## Quick start
 
@@ -126,6 +127,44 @@ df = df.with_column("keywords", matcher.match_batch(df["normalized"]))
 returns each configured keyword at most once in configuration order, and
 returns null for null text. Keyword configuration is validated when the first
 entrypoint is invoked because Daft initializes operator instances lazily.
+
+## Robotics operators
+
+`McapVideoExtractor` turns one MCAP camera capture into one MP4 object. MCAP
+input accepts local paths, fsspec-compatible `tos://bucket/key` URIs, and
+HTTP(S) URLs. MP4 output accepts local paths and `tos://` URIs. Local paths
+also use fsspec, and callers may inject a compatible filesystem at
+construction. Other fsspec protocols are not yet accepted by this operator.
+The UDF returns metadata, not the MP4 bytes, and runs as a 1:1 Daft row
+operator.
+
+```python
+import daft
+
+from mmops.operators.robotics import McapVideoExtractor
+
+df = daft.from_pydict(
+    {
+        "mcap_uri": ["tos://input-bucket/captures/cam0.mcap"],
+        "mp4_uri": ["tos://output-bucket/run-20261012/cam0.mp4"],
+    }
+)
+extractor = McapVideoExtractor()  # defaults to H.264 output
+result = df.with_column(
+    "video",
+    extractor.extract(df["mcap_uri"], df["mp4_uri"]),
+)
+print(result.select("video").to_pydict())  # triggers Daft execution
+```
+
+For `tos://` access without an injected filesystem, set `TOS_ENDPOINT`,
+`TOS_REGION`, `TOS_ACCESS_KEY`, and `TOS_SECRET_KEY` in every Daft worker's
+environment; temporary credentials also need `TOS_SECURITY_TOKEN`. Keep
+their values out of code, DataFrame columns, and serialized filesystems.
+See the [McapVideoExtractor usage
+guide](docs/operators/robotics/mcap-video-extractor.md) for filesystem
+injection, credential setup, codec options, output schema, and publication
+safeguards.
 
 ## Current execution scope
 

@@ -26,26 +26,86 @@ def test_text_extra_installs_the_current_daft_runtime() -> None:
     assert "daft" in _names(extras["text"])
 
 
-def test_all_extra_contains_every_released_modality_dependency() -> None:
+def test_all_extra_contains_every_released_domain_dependency() -> None:
     extras = _extras()
-    modalities = ("text", "image", "audio", "video", "document", "multimodal")
-    modality_dependencies = {
-        requirement for modality in modalities for requirement in extras[modality]
+    domains = (
+        "text",
+        "image",
+        "audio",
+        "video",
+        "robotics",
+        "document",
+        "multimodal",
+    )
+    domain_dependencies = {
+        requirement for domain in domains for requirement in extras[domain]
     }
 
     assert "all" in extras
-    assert set(extras["all"]) == modality_dependencies
+    assert set(extras["all"]) == domain_dependencies
 
 
-def test_unreleased_modality_extras_are_reserved_and_empty() -> None:
+def test_robotics_extra_installs_mcap_remux_and_tos_filesystem_dependencies() -> None:
     extras = _extras()
 
-    for modality in ("image", "audio", "video", "document", "multimodal"):
-        assert modality in extras
-        assert extras[modality] == []
+    assert {"daft", "mcap", "mcap-ros2-support", "av", "fsspec", "tosfs"} <= _names(
+        extras["robotics"]
+    )
+    assert "tos" not in _names(extras["robotics"])
+
+
+def test_mcap_video_guide_is_linked_and_documents_worker_configuration() -> None:
+    guide_path = ROOT / "docs" / "operators" / "robotics" / "mcap-video-extractor.md"
+
+    assert (
+        "(docs/operators/robotics/mcap-video-extractor.md)"
+        in (ROOT / "README.md").read_text()
+    )
+    guide = guide_path.read_text()
+    for variable in (
+        "TOS_ENDPOINT",
+        "TOS_REGION",
+        "TOS_ACCESS_KEY",
+        "TOS_SECRET_KEY",
+        "TOS_SECURITY_TOKEN",
+    ):
+        assert f"`{variable}`" in guide
+
+
+def test_test_extra_installs_dependencies_imported_by_the_full_suite() -> None:
+    extras = _extras()
+
+    assert {
+        "daft",
+        "mcap",
+        "mcap-ros2-support",
+        "av",
+        "fsspec",
+        "tosfs",
+        "pytest",
+    } <= _names(extras["test"])
+
+
+def test_unreleased_domain_extras_are_reserved_and_empty() -> None:
+    extras = _extras()
+
+    for domain in ("image", "audio", "video", "document", "multimodal"):
+        assert domain in extras
+        assert extras[domain] == []
 
 
 def test_dev_extra_supports_every_documented_verification_command() -> None:
     extras = _extras()
 
-    assert {"daft", "pytest", "black", "build", "twine"} <= _names(extras["dev"])
+    assert {
+        "daft",
+        "mcap",
+        "mcap-ros2-support",
+        "av",
+        "fsspec",
+        "tosfs",
+        "pytest",
+        "black",
+        "build",
+        "twine",
+    } <= _names(extras["dev"])

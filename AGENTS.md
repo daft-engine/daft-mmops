@@ -19,10 +19,11 @@ These instructions apply to the entire repository.
 - Do not claim that Ray Data or another engine is implemented or supported.
 - Keep engine bindings isolated internally so future implementations do not
   require rewriting every operator.
-- Keep the planned modality extras declared. Unreleased modalities remain
+- Keep the planned domain extras declared. Unreleased domains remain
   empty. `all` must be the exact flattened dependency union of `text`, `image`,
-  `audio`, `video`, `document`, and `multimodal`; update it, installation docs,
-  and packaging tests whenever any modality dependency changes.
+  `audio`, `video`, `robotics`, `document`, and `multimodal`; update it,
+  installation docs, and packaging tests whenever any domain dependency
+  changes.
 - Use only public Daft APIs. Never import private `daft.udf.udf_v2` helpers such
   as `Func._from_func` or `mark_cls_method`.
 - Operator business code must use Python scalar or PyArrow interfaces, not
