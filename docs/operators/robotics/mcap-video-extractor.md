@@ -1,4 +1,4 @@
-# McapVideoExtractor usage
+# Robotics: McapVideoExtractor usage
 
 `McapVideoExtractor` is a Daft row UDF that turns one camera stream in an MCAP
 file into one MP4 file. Each input row produces one metadata result; the MP4

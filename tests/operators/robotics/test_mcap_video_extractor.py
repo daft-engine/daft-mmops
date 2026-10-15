@@ -555,6 +555,34 @@ def test_extract_reads_tos_uri_through_fsspec(
     assert output.exists()
 
 
+def test_extract_reads_tos_stream_that_overreturns_requested_bytes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "camera.mcap"
+    output = tmp_path / "camera.mp4"
+    _write_compressed_image_mcap(source)
+    payload = source.read_bytes()
+
+    class OverreadingStream(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            return super().read(size + 1 if size >= 0 else size)
+
+    class OverreadingFilesystem:
+        protocol = "tos"
+
+        def open(self, path: str, mode: str, **kwargs: object) -> OverreadingStream:
+            assert path == "input/camera.mcap"
+            assert mode == "rb"
+            return OverreadingStream(payload)
+
+    result = operators.McapVideoExtractor(filesystem=OverreadingFilesystem()).extract(
+        "tos://input/camera.mcap", str(output)
+    )
+
+    assert result["frame_count"] == 3
+    assert output.exists()
+
+
 class _MemoryTosFilesystem:
     protocol = "tos"
 

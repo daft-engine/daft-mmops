@@ -55,9 +55,12 @@ def test_robotics_extra_installs_mcap_remux_and_tos_filesystem_dependencies() ->
 
 
 def test_mcap_video_guide_is_linked_and_documents_worker_configuration() -> None:
-    guide_path = ROOT / "docs" / "mcap-video-extractor.md"
+    guide_path = ROOT / "docs" / "operators" / "robotics" / "mcap-video-extractor.md"
 
-    assert "(docs/mcap-video-extractor.md)" in (ROOT / "README.md").read_text()
+    assert (
+        "(docs/operators/robotics/mcap-video-extractor.md)"
+        in (ROOT / "README.md").read_text()
+    )
     guide = guide_path.read_text()
     for variable in (
         "TOS_ENDPOINT",

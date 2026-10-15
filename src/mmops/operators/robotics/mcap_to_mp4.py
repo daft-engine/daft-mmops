@@ -225,9 +225,21 @@ class McapVideoExtractor:
 class _NonSeekingStream:
     def __init__(self, source: Any) -> None:
         self._source = source
+        self._buffer = bytearray()
 
     def read(self, amount: int = -1) -> bytes:
-        return self._source.read(amount)
+        if amount < 0:
+            buffered = bytes(self._buffer)
+            self._buffer.clear()
+            return buffered + self._source.read(amount)
+        while len(self._buffer) < amount:
+            chunk = self._source.read(amount - len(self._buffer))
+            if not chunk:
+                break
+            self._buffer.extend(chunk)
+        result = bytes(self._buffer[:amount])
+        del self._buffer[:amount]
+        return result
 
     def seekable(self) -> bool:
         return False

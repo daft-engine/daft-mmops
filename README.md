@@ -160,10 +160,11 @@ print(result.select("video").to_pydict())  # triggers Daft execution
 For `tos://` access without an injected filesystem, set `TOS_ENDPOINT`,
 `TOS_REGION`, `TOS_ACCESS_KEY`, and `TOS_SECRET_KEY` in every Daft worker's
 environment; temporary credentials also need `TOS_SECURITY_TOKEN`. Keep
-their values out of code, DataFrame columns, and serialized filesystems. See
-the [McapVideoExtractor usage guide](docs/mcap-video-extractor.md) for
-filesystem injection, credential setup, codec options, output schema, and
-publication safeguards.
+their values out of code, DataFrame columns, and serialized filesystems.
+See the [McapVideoExtractor usage
+guide](docs/operators/robotics/mcap-video-extractor.md) for filesystem
+injection, credential setup, codec options, output schema, and publication
+safeguards.
 
 ## Current execution scope
 
