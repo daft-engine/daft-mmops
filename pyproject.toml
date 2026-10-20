@@ -20,17 +20,38 @@ text = ["daft>=0.7"]
 image = []
 audio = []
 video = []
+robotics = [
+    "daft>=0.7",
+    "mcap>=1.3,<2",
+    "mcap-ros2-support>=0.5,<1",
+    "av>=15,<17",
+    "fsspec>=2023.5",
+]
 document = []
 multimodal = []
-# Flattened union of text + image + audio + video + document + multimodal.
+# Flattened union of text + image + audio + video + robotics + document + multimodal.
 # PEP 621 extras cannot directly include other extras by name.
-all = ["daft>=0.7"]
+all = [
+    "daft>=0.7",
+    "mcap>=1.3,<2",
+    "mcap-ros2-support>=0.5,<1",
+    "av>=15,<17",
+    "fsspec>=2023.5",
+]
 test = [
     "daft>=0.7",
+    "mcap>=1.3,<2",
+    "mcap-ros2-support>=0.5,<1",
+    "av>=15,<17",
+    "fsspec>=2023.5",
     "pytest>=7",
 ]
 dev = [
     "daft>=0.7",
+    "mcap>=1.3,<2",
+    "mcap-ros2-support>=0.5,<1",
+    "av>=15,<17",
+    "fsspec>=2023.5",
     "pytest>=7",
     "black>=24",
     "build>=1",
