@@ -1,0 +1,100 @@
+name: CI
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DAFT_ANALYTICS_ENABLED: "0"
+  DAFT_PROGRESS_BAR: "0"
+  PYTHONUNBUFFERED: "1"
+
+# Cancel superseded runs: group by PR number, otherwise by push SHA.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and package on Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+    - uses: actions/checkout@v4
+
+    # Video operator tests shell out to ffmpeg/ffprobe and skip themselves when
+    # the binaries are missing; install them so the full suite is exercised.
+    - name: Install media tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends ffmpeg
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
+        cache-dependency-path: pyproject.toml
+
+    - name: Verify interpreter version
+      run: |
+        python -c 'import sys; expected=tuple(map(int, "${{ matrix.python-version }}".split("."))); assert sys.version_info[:2] == expected, (sys.version, expected)'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -e '.[dev]'
+
+    - name: Run test suite
+      run: python -m pytest -q
+
+    - name: Build distributions
+      run: python -m build
+
+    - name: Validate distributions
+      run: python -m twine check dist/*
+
+    - name: Upload distributions
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: dist-py${{ matrix.python-version }}
+        path: dist/
+        if-no-files-found: ignore
+
+  quality:
+    name: Code quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: pip
+        cache-dependency-path: pyproject.toml
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -e '.[dev]'
+
+    - name: Check formatting
+      run: black --check src tests examples
+
+    - name: Byte-compile sources
+      run: python -m compileall -q src tests examples
+
+    - name: Check whitespace
+      run: git diff --check
