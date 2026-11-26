@@ -16,7 +16,6 @@ from .._definitions import (
     OperatorDefinition,
 )
 
-
 _ENTRYPOINT_OPTION_KEYS = frozenset(
     {
         "return_dtype",

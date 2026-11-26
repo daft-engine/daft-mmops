@@ -5,7 +5,6 @@ import pyarrow.compute as pc
 
 from ..._decorators import batch
 
-
 _NORMALIZATION_FORMS = frozenset({"NFC", "NFKC", "NFD", "NFKD"})
 
 

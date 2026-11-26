@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
-import tomllib
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,7 +19,12 @@ def _extras() -> dict[str, list[str]]:
 
 def _names(requirements: list[str]) -> set[str]:
     return {
-        requirement.split("[", 1)[0].split("<", 1)[0].split(">", 1)[0].split("=", 1)[0]
+        requirement.split(";", 1)[0]
+        .split("[", 1)[0]
+        .split("<", 1)[0]
+        .split(">", 1)[0]
+        .split("=", 1)[0]
+        .strip()
         for requirement in requirements
     }
 

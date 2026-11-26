@@ -79,7 +79,16 @@ def test_explicit_unsupported_daft_option_is_never_silently_dropped() -> None:
         identity(1)
 
 
-def test_explicit_resource_unsupported_by_installed_daft_is_reported() -> None:
+def test_explicit_resource_unsupported_by_installed_daft_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_func = daft.func
+
+    def func_without_cpus(fn: object, *, return_dtype: object = None) -> object:
+        return original_func(fn, return_dtype=return_dtype)
+
+    monkeypatch.setattr(daft, "func", func_without_cpus)
+
     @mmops.row(resources=mmops.Resources(cpus=1))
     def identity(value: int) -> int:
         return value

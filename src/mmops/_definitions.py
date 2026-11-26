@@ -7,7 +7,6 @@ from typing import Any, Callable, Iterator, Literal, Mapping, Sequence, TypeVar
 
 import pyarrow as pa
 
-
 ErrorPolicy = Literal["raise", "log", "ignore"]
 EntrypointKind = Literal["row", "batch"]
 K = TypeVar("K")

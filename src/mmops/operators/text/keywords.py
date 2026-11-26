@@ -7,7 +7,6 @@ import pyarrow as pa
 
 from ..._decorators import batch, operator, row
 
-
 KEYWORD_MATCH_DTYPE = pa.list_(pa.string())
 
 
