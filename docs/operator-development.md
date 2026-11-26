@@ -185,6 +185,39 @@ expensive initialization and connection reuse, not for:
 Keep credentials, access tokens, and environment-specific endpoints out of
 source code and serialized operator metadata.
 
+Operators that publish files or objects are still 1:1 row transforms, but the
+external write is a side effect. They must write to a temporary target, verify
+the completed artifact, publish without silently overwriting an existing
+target, and return only after publication succeeds. Their documentation must
+state retry/idempotency behavior and temporary-disk requirements; callers must
+use unique run-scoped output paths when the engine cannot provide exactly-once
+external writes.
+
+For object stores that cannot atomically upload and verify a final key, publish
+through a unique staging key: upload, verify the staged size and content
+digest, conditionally copy to the final no-overwrite key, verify the final
+size and digest, and remove the staging object. A failed staging verification
+must never poison the final key.
+An operator may delegate those backend-specific steps to an injected
+filesystem or publication wrapper, but must check for that capability before
+reading the input and fail closed when it is unavailable.
+Calculate the local content digest while streaming the upload instead of
+adding a separate full local-file pass. A wrapper may return a publication
+receipt that attests the final object's size and cryptographic digest. Skip a
+final-object download only when the digest is a backend-provided cryptographic
+checksum bound to that exact final object or version; ETags and caller-written
+metadata are not sufficient. Otherwise perform one bounded final readback and
+verify its exact size and digest.
+
+Before relying on an object-store no-overwrite condition, verify that bucket
+features such as versioning do not disable that condition. Fail closed when
+the store cannot guarantee create-only publication. Never delete an ambiguous
+unversioned final key after failed verification because a concurrent writer
+may have replaced it between HEAD and DELETE; only an exact returned version
+identifier is safe to remove.
+Likewise, do not delete a staging object by key when its identity check has
+failed; warn and leave it for explicit inspection instead.
+
 ## Daft integration boundary
 
 Operator business code uses Python scalars and PyArrow arrays. Daft integration
@@ -217,6 +250,7 @@ src/mmops/operators/
 ├── image/
 ├── audio/
 ├── video/
+├── robotics/
 ├── document/
 └── multimodal/
 ```
@@ -229,14 +263,19 @@ belong in optional extras and should be imported only by the relevant domain
 module or execution path. Users must not need to rebuild Daft or edit installed
 Daft source code.
 
-Each planned modality has a same-named extra in `pyproject.toml`. Extras for
-modalities without production operators remain empty and are documented as
+The root `mmops.operators` catalog lazily exports public operators from their
+domain packages. Adding a root export must not eagerly import any domain
+package; importing one domain must not import another. Domain modules must also
+keep optional heavy dependencies on the execution paths that require them.
+
+Each planned domain has a same-named extra in `pyproject.toml`. Extras for
+domains without production operators remain empty and are documented as
 reserved, not supported. When the first operator is released, add the Daft
-runtime and any modality dependencies to that extra. The `all` extra must equal
+runtime and any domain dependencies to that extra. The `all` extra must equal
 the flattened dependency union of `text`, `image`, `audio`, `video`,
-`document`, and `multimodal`; PEP 621 extras cannot reference one another by
-name. Update the modality extra, `all`, README installation table, and
-packaging tests in the same change as a new operator dependency.
+`robotics`, `document`, and `multimodal`; PEP 621 extras cannot reference one
+another by name. Update the domain extra, `all`, README installation table,
+and packaging tests in the same change as a new operator dependency.
 
 Each production operator must document:
 
