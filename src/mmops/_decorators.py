@@ -13,7 +13,6 @@ from ._definitions import (
     Resources,
 )
 
-
 F = TypeVar("F", bound=Callable[..., Any])
 T = TypeVar("T", bound=type)
 

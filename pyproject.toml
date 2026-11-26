@@ -28,10 +28,12 @@ all = ["daft>=0.7"]
 test = [
     "daft>=0.7",
     "pytest>=7",
+    "tomli>=2; python_version < '3.11'",
 ]
 dev = [
     "daft>=0.7",
     "pytest>=7",
+    "tomli>=2; python_version < '3.11'",
     "black>=24",
     "build>=1",
     "twine>=5",

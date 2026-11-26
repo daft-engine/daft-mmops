@@ -1,11 +1,27 @@
 from __future__ import annotations
 
-import numpy as np
+import array
+
 import pyarrow as pa
 import pytest
 
 from mmops import BatchOutputError, batch
 from mmops._arrow import to_arrow_argument, validate_batch_output
+
+_INVALID_CONTAINERS: list[object] = [
+    [1, 2],
+    array.array("q", [1, 2]),
+    pa.record_batch({"value": [1, 2]}),
+    pa.table({"value": [1, 2]}),
+    pa.chunked_array([[1], [2]]),
+]
+
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    pass
+else:
+    _INVALID_CONTAINERS.append(np.array([1, 2]))
 
 
 class SeriesLike:
@@ -46,15 +62,7 @@ def test_scalar_argument_is_passed_through() -> None:
     assert to_arrow_argument(marker) is marker
 
 
-@pytest.mark.parametrize(
-    "invalid",
-    [
-        [1, 2],
-        np.array([1, 2]),
-        pa.table({"value": [1, 2]}),
-        pa.chunked_array([[1], [2]]),
-    ],
-)
+@pytest.mark.parametrize("invalid", _INVALID_CONTAINERS)
 def test_batch_output_rejects_non_array_containers(invalid: object) -> None:
     with pytest.raises(BatchOutputError, match="pyarrow.Array"):
         validate_batch_output(invalid, _definition(), expected_length=2)
